@@ -20,24 +20,61 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS daily_stats (
             log_date TEXT PRIMARY KEY,
-            keystrokes INTEGER
+            keystrokes INTEGER,
+            max_kpm INTEGER DEFAULT 0
         )
     ''')
-    # Safe Schema Migration for advanced stats
-    try:
-        cursor.execute('ALTER TABLE daily_stats ADD COLUMN max_kpm INTEGER DEFAULT 0')
-    except sqlite3.OperationalError:
-        pass
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    # Default settings
+    cursor.execute('INSERT OR IGNORE INTO settings (key, value) VALUES ("daily_goal", "5000")')
+    cursor.execute('INSERT OR IGNORE INTO settings (key, value) VALUES ("show_widget", "0")')
     conn.commit()
     return conn
+
+# --- Floating Widget Class ---
+class FloatingWidget(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.geometry("180x60+20+20")
+        self.overrideredirect(True) # Remove borders
+        self.attributes("-topmost", True) # Always on top
+        self.attributes("-alpha", 0.85) # Slight transparency
+        
+        self.parent = parent
+        
+        self.label = ctk.CTkLabel(self, text="0 KPM\n0 Today", font=("Helvetica", 14, "bold"), text_color="#2FA572")
+        self.label.pack(expand=True)
+        
+        # Make draggable
+        self.bind("<ButtonPress-1>", self.start_move)
+        self.bind("<B1-Motion>", self.do_move)
+
+    def start_move(self, event):
+        self.x = event.x
+        self.y = event.y
+
+    def do_move(self, event):
+        deltax = event.x - self.x
+        deltay = event.y - self.y
+        x = self.winfo_x() + deltax
+        y = self.winfo_y() + deltay
+        self.geometry(f"+{x}+{y}")
+        
+    def update_text(self, kpm, count):
+        self.label.configure(text=f"⚡ {kpm} KPM\n🎯 {count} Today")
 
 
 # --- Main Application Class ---
 class KeyPulseApp(ctk.CTk):
     def __init__(self, start_minimized=False):
         super().__init__()
-        self.title("KeyPulse - Premium")
-        self.geometry("550x650")
+        self.title("KeyPulse - Ultra Premium")
+        self.geometry("550x700")
         self.resizable(False, False)
         
         self.protocol('WM_DELETE_WINDOW', self.hide_window)
@@ -46,15 +83,23 @@ class KeyPulseApp(ctk.CTk):
         self.conn = init_db()
         self.today = str(date.today())
         self.count, self.max_kpm_today = self.get_today_stats()
-        self.lock = threading.Lock()
+        self.daily_goal = self.get_setting("daily_goal", int, 5000)
+        self.show_widget_flag = self.get_setting("show_widget", int, 0)
+        self.lifetime_total = 0
         
+        self.lock = threading.Lock()
         self.keystroke_timestamps = []
-        self.daily_goal = 5000
         self.last_press_time = time.time()
         self.is_idle = False
+        
+        # Floating Widget
+        self.floating_widget = None
 
         # Build UI
         self.build_ui()
+        
+        if self.show_widget_flag:
+            self.toggle_widget()
 
         # Start Listener
         self.listener_thread = threading.Thread(target=self.start_listener, daemon=True)
@@ -69,13 +114,26 @@ class KeyPulseApp(ctk.CTk):
         if start_minimized:
             self.hide_window()
 
+    def get_setting(self, key, cast_type, default):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
+        row = cursor.fetchone()
+        return cast_type(row[0]) if row else default
+
+    def set_setting(self, key, value):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('UPDATE settings SET value = ? WHERE key = ?', (str(value), key))
+            self.conn.commit()
+
     def build_ui(self):
-        # Tabs for Dashboard and Insights
-        self.tabview = ctk.CTkTabview(self, width=500, height=600)
+        # Tabs
+        self.tabview = ctk.CTkTabview(self, width=500, height=650)
         self.tabview.pack(padx=20, pady=10)
         
         self.tab_dash = self.tabview.add("Dashboard")
-        self.tab_stats = self.tabview.add("Insights & Settings")
+        self.tab_stats = self.tabview.add("Insights & Badges")
+        self.tab_settings = self.tabview.add("Settings")
 
         # --- TAB 1: DASHBOARD ---
         self.title_label = ctk.CTkLabel(self.tab_dash, text="⚡ KeyPulse", font=("Helvetica", 28, "bold"))
@@ -88,7 +146,7 @@ class KeyPulseApp(ctk.CTk):
         self.count_label.pack(pady=(10, 0))
         
         self.info_label = ctk.CTkLabel(self.tab_dash, text="Keystrokes Today\n(🔒 Privacy mode: No keys recorded)", font=("Helvetica", 12), text_color="gray")
-        self.info_label.pack(pady=(0, 20))
+        self.info_label.pack(pady=(0, 15))
 
         # Goal Progress
         self.goal_frame = ctk.CTkFrame(self.tab_dash, fg_color="transparent")
@@ -101,19 +159,18 @@ class KeyPulseApp(ctk.CTk):
         self.progress_bar.pack(fill="x", pady=5)
         self.progress_bar.set(min(self.count / self.daily_goal, 1.0))
 
-        # KPM Stats
+        # KPM & WPM Stats
         self.kpm_frame = ctk.CTkFrame(self.tab_dash)
-        self.kpm_frame.pack(fill="x", padx=40, pady=20)
+        self.kpm_frame.pack(fill="x", padx=40, pady=15)
         
-        self.kpm_label = ctk.CTkLabel(self.kpm_frame, text="Speed: 0 KPM", font=("Helvetica", 16, "bold"), text_color="#2FA572")
+        self.kpm_label = ctk.CTkLabel(self.kpm_frame, text="Speed: 0 KPM\n(~0 WPM)", font=("Helvetica", 16, "bold"), text_color="#2FA572")
         self.kpm_label.pack(side="left", padx=20, pady=10)
         
         self.max_kpm_label = ctk.CTkLabel(self.kpm_frame, text=f"Max KPM: {self.max_kpm_today}", font=("Helvetica", 14), text_color="gray")
         self.max_kpm_label.pack(side="right", padx=20, pady=10)
 
 
-        # --- TAB 2: INSIGHTS & SETTINGS ---
-        # Lifetime Stats
+        # --- TAB 2: INSIGHTS & BADGES ---
         self.lifetime_frame = ctk.CTkFrame(self.tab_stats)
         self.lifetime_frame.pack(fill="x", padx=20, pady=10)
         
@@ -130,19 +187,40 @@ class KeyPulseApp(ctk.CTk):
         self.heat_canvas = ctk.CTkCanvas(self.tab_stats, width=420, height=120, bg="#2b2b2b", highlightthickness=0)
         self.heat_canvas.pack(pady=5)
         
-        # Action Buttons
-        self.btn_frame = ctk.CTkFrame(self.tab_stats, fg_color="transparent")
-        self.btn_frame.pack(fill="x", padx=20, pady=20)
-
-        self.export_btn = ctk.CTkButton(self.btn_frame, text="Export CSV", command=self.export_csv)
-        self.export_btn.pack(side="left", padx=10)
+        # Badges
+        self.badge_label = ctk.CTkLabel(self.tab_stats, text="🏆 Achievements", font=("Helvetica", 14, "bold"))
+        self.badge_label.pack(pady=(15, 5))
         
-        self.autostart_var = ctk.BooleanVar()
-        self.autostart_switch = ctk.CTkSwitch(self.btn_frame, text="Auto-Start with Windows", variable=self.autostart_var, command=self.toggle_autostart)
-        self.autostart_switch.pack(side="right", padx=10)
+        self.badges_display = ctk.CTkLabel(self.tab_stats, text="Loading...", font=("Helvetica", 13), text_color="#ffcc00")
+        self.badges_display.pack()
 
-        self.export_status = ctk.CTkLabel(self.tab_stats, text="", font=("Helvetica", 12), text_color="#2FA572")
-        self.export_status.pack()
+
+        # --- TAB 3: SETTINGS ---
+        # Goal Setting
+        self.set_goal_label = ctk.CTkLabel(self.tab_settings, text="Set Daily Goal:", font=("Helvetica", 14))
+        self.set_goal_label.pack(pady=(15, 5))
+        
+        self.goal_entry = ctk.CTkEntry(self.tab_settings, placeholder_text="e.g. 5000")
+        self.goal_entry.pack(pady=5)
+        self.goal_entry.insert(0, str(self.daily_goal))
+        
+        self.save_goal_btn = ctk.CTkButton(self.tab_settings, text="Save Goal", command=self.save_goal)
+        self.save_goal_btn.pack(pady=5)
+        
+        self.settings_msg = ctk.CTkLabel(self.tab_settings, text="", font=("Helvetica", 12), text_color="#2FA572")
+        self.settings_msg.pack(pady=5)
+
+        # Toggles
+        self.widget_var = ctk.BooleanVar(value=bool(self.show_widget_flag))
+        self.widget_switch = ctk.CTkSwitch(self.tab_settings, text="Enable Floating Mini-Widget", variable=self.widget_var, command=self.toggle_widget)
+        self.widget_switch.pack(pady=10, anchor="w", padx=40)
+
+        self.autostart_var = ctk.BooleanVar()
+        self.autostart_switch = ctk.CTkSwitch(self.tab_settings, text="Auto-Start with Windows", variable=self.autostart_var, command=self.toggle_autostart)
+        self.autostart_switch.pack(pady=10, anchor="w", padx=40)
+
+        self.export_btn = ctk.CTkButton(self.tab_settings, text="Export Data to CSV", command=self.export_csv)
+        self.export_btn.pack(pady=20)
 
         self.refresh_stats()
 
@@ -184,7 +262,7 @@ class KeyPulseApp(ctk.CTk):
         
         # Idle Detection & KPM
         current_time = time.time()
-        self.is_idle = (current_time - self.last_press_time) > 120 # 2 minutes idle
+        self.is_idle = (current_time - self.last_press_time) > 120
         
         if self.is_idle:
             self.status_label.configure(text="Status: Idle 🟠", text_color="orange")
@@ -193,12 +271,18 @@ class KeyPulseApp(ctk.CTk):
             
         self.keystroke_timestamps = [t for t in self.keystroke_timestamps if current_time - t <= 60]
         kpm = len(self.keystroke_timestamps)
+        wpm = kpm // 5 # Approximate Words Per Minute
         
         if kpm > self.max_kpm_today:
             self.max_kpm_today = kpm
             self.max_kpm_label.configure(text=f"Max KPM: {self.max_kpm_today}")
             
-        self.kpm_label.configure(text=f"Speed: {kpm} KPM")
+        self.kpm_label.configure(text=f"Speed: {kpm} KPM\n(~{wpm} WPM)")
+        
+        # Update Floating Widget
+        if self.floating_widget and self.floating_widget.winfo_exists():
+            self.floating_widget.update_text(kpm, self.count)
+
         self.after(200, self.update_ui)
 
     def refresh_stats(self):
@@ -207,20 +291,31 @@ class KeyPulseApp(ctk.CTk):
         # Lifetime Stats
         cursor.execute('SELECT SUM(keystrokes), MAX(keystrokes) FROM daily_stats')
         res = cursor.fetchone()
-        lifetime_total = res[0] if res[0] else 0
+        self.lifetime_total = res[0] if res[0] else 0
         best_day_count = res[1] if res[1] else 0
         
-        self.stat_total.configure(text=f"Lifetime Keystrokes: {lifetime_total:,}")
+        self.stat_total.configure(text=f"Lifetime Keystrokes: {self.lifetime_total:,}")
         
         cursor.execute('SELECT log_date FROM daily_stats WHERE keystrokes = ?', (best_day_count,))
         best_day_row = cursor.fetchone()
         best_day_date = best_day_row[0] if best_day_row else "N/A"
         self.stat_best.configure(text=f"Best Day: {best_day_date} ({best_day_count:,} keys)")
 
-        # 30-Day Heatmap (GitHub Style)
-        self.heat_canvas.delete("all")
+        # Badges Logic
+        badges = []
+        if self.lifetime_total >= 1000: badges.append("🥉 1k Typer")
+        if self.lifetime_total >= 10000: badges.append("🥈 10k Pro")
+        if self.max_kpm_today >= 200: badges.append("🔥 Speed Demon")
+        if self.max_kpm_today >= 400: badges.append("🚀 Flash")
+        if self.count >= self.daily_goal: badges.append("⭐ Goal Crusher")
         
-        # Fetch last 30 days
+        if not badges:
+            badges.append("Keep typing to unlock badges!")
+            
+        self.badges_display.configure(text=" | ".join(badges))
+
+        # 30-Day Heatmap
+        self.heat_canvas.delete("all")
         day_counts = {}
         for i in range(29, -1, -1):
             d = str(date.today() - timedelta(days=i))
@@ -228,7 +323,6 @@ class KeyPulseApp(ctk.CTk):
             r = cursor.fetchone()
             day_counts[d] = r[0] if r else 0
 
-        # Draw grid (6 cols x 5 rows = 30 days)
         box_size = 20
         padding = 5
         start_x = (420 - (6 * (box_size + padding))) / 2
@@ -240,7 +334,6 @@ class KeyPulseApp(ctk.CTk):
             row = i % 5
             count = day_counts[d]
             
-            # Determine color intensity
             if count == 0: color = "#3a3a3a"
             elif count < 1000: color = "#1f6aa5"
             elif count < 3000: color = "#2FA572"
@@ -249,29 +342,46 @@ class KeyPulseApp(ctk.CTk):
             
             x0 = start_x + col * (box_size + padding)
             y0 = start_y + row * (box_size + padding)
-            x1 = x0 + box_size
-            y1 = y0 + box_size
-            
-            self.heat_canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
+            self.heat_canvas.create_rectangle(x0, y0, x0+box_size, y0+box_size, fill=color, outline="")
 
-    # --- Premium Features ---
+    # --- Actions & Settings ---
+    def save_goal(self):
+        try:
+            val = int(self.goal_entry.get())
+            self.daily_goal = val
+            self.set_setting("daily_goal", val)
+            self.goal_label.configure(text=f"Daily Goal: {self.daily_goal}")
+            self.settings_msg.configure(text="Goal saved successfully!", text_color="#2FA572")
+        except ValueError:
+            self.settings_msg.configure(text="Please enter a valid number.", text_color="red")
+        self.after(3000, lambda: self.settings_msg.configure(text=""))
+
+    def toggle_widget(self):
+        state = self.widget_var.get()
+        self.set_setting("show_widget", int(state))
+        
+        if state:
+            if self.floating_widget is None or not self.floating_widget.winfo_exists():
+                self.floating_widget = FloatingWidget(self)
+        else:
+            if self.floating_widget and self.floating_widget.winfo_exists():
+                self.floating_widget.destroy()
+
     def export_csv(self):
         desktop = os.path.join(os.environ['USERPROFILE'], 'Desktop')
         path = os.path.join(desktop, 'KeyPulse_Export.csv')
         cursor = self.conn.cursor()
         cursor.execute('SELECT * FROM daily_stats ORDER BY log_date DESC')
         rows = cursor.fetchall()
-        
         try:
             with open(path, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(['Date', 'Keystrokes', 'Max KPM'])
                 writer.writerows(rows)
-            self.export_status.configure(text=f"Exported to Desktop!", text_color="#2FA572")
+            self.settings_msg.configure(text="Exported to Desktop!", text_color="#2FA572")
         except Exception as e:
-            self.export_status.configure(text=f"Export failed: {e}", text_color="red")
-            
-        self.after(3000, lambda: self.export_status.configure(text=""))
+            self.settings_msg.configure(text=f"Export failed: {e}", text_color="red")
+        self.after(3000, lambda: self.settings_msg.configure(text=""))
 
     def check_autostart(self):
         key = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -301,7 +411,7 @@ class KeyPulseApp(ctk.CTk):
     def create_tray_image(self):
         image = Image.new('RGB', (64, 64), color="#1f6aa5")
         draw = ImageDraw.Draw(image)
-        draw.polygon([(32, 10), (15, 35), (30, 35), (25, 54), (49, 29), (32, 29)], fill="white") # Lightning bolt
+        draw.polygon([(32, 10), (15, 35), (30, 35), (25, 54), (49, 29), (32, 29)], fill="white")
         return image
 
     def hide_window(self):
@@ -310,7 +420,7 @@ class KeyPulseApp(ctk.CTk):
             pystray.MenuItem('Open KeyPulse', self.show_window),
             pystray.MenuItem('Exit', self.quit_window)
         )
-        self.icon = pystray.Icon("KeyPulse", self.create_tray_image(), "KeyPulse", menu)
+        self.icon = pystray.Icon("KeyPulse", self.create_tray_image(), "KeyPulse Tracker", menu)
         threading.Thread(target=self.icon.run, daemon=True).start()
 
     def show_window(self, icon, item):
