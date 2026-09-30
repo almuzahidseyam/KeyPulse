@@ -33,8 +33,8 @@ def init_db():
     
     cursor.execute('INSERT OR IGNORE INTO settings (key, value) VALUES ("daily_goal", "5000")')
     cursor.execute('INSERT OR IGNORE INTO settings (key, value) VALUES ("show_widget", "0")')
+    cursor.execute('INSERT OR IGNORE INTO settings (key, value) VALUES ("widget_geom", "180x60+20+20")')
     
-    # Safe Schema Migration
     cursor.execute("PRAGMA table_info(daily_stats)")
     columns = [col[1] for col in cursor.fetchall()]
     if "max_kpm" not in columns:
@@ -47,18 +47,23 @@ def init_db():
 class FloatingWidget(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
-        self.geometry("180x60+20+20")
+        self.parent = parent
+        
+        # Load saved position
+        saved_geom = self.parent.get_setting("widget_geom", str, "180x60+20+20")
+        self.geometry(saved_geom)
+        
         self.overrideredirect(True) 
         self.attributes("-topmost", True) 
         self.attributes("-alpha", 0.85) 
         
-        self.parent = parent
-        
         self.label = ctk.CTkLabel(self, text="0 KPM\n0 Today", font=("Helvetica", 14, "bold"), text_color="#2FA572")
         self.label.pack(expand=True)
         
+        # Dragging events
         self.bind("<ButtonPress-1>", self.start_move)
         self.bind("<B1-Motion>", self.do_move)
+        self.bind("<ButtonRelease-1>", self.stop_move)
 
     def start_move(self, event):
         self.x = event.x
@@ -71,6 +76,10 @@ class FloatingWidget(ctk.CTkToplevel):
         y = self.winfo_y() + deltay
         self.geometry(f"+{x}+{y}")
         
+    def stop_move(self, event):
+        # Save position to DB on release
+        self.parent.set_setting("widget_geom", self.geometry())
+        
     def update_text(self, kpm, count):
         self.label.configure(text=f"⚡ {kpm} KPM\n🎯 {count} Today")
 
@@ -79,53 +88,56 @@ class FloatingWidget(ctk.CTkToplevel):
 class KeyPulseApp(ctk.CTk):
     def __init__(self, start_minimized=False):
         super().__init__()
+        self.withdraw() # Hide immediately to prevent flicker on startup
+        
         self.title("KeyPulse - Ultra Premium")
         self.geometry("550x700")
         self.resizable(False, False)
-        
         self.protocol('WM_DELETE_WINDOW', self.hide_window)
 
         # State Variables
+        self.lock = threading.Lock()
         self.conn = init_db()
         self.today = str(date.today())
+        
         self.count, self.max_kpm_today = self.get_today_stats()
-        self.last_saved_count = self.count # For efficient DB writes
+        self.last_saved_count = self.count
         self.save_ticker = 0
         
         self.daily_goal = self.get_setting("daily_goal", int, 5000)
         self.show_widget_flag = self.get_setting("show_widget", int, 0)
         self.lifetime_total = 0
         
-        self.lock = threading.Lock()
         self.keystroke_timestamps = []
         self.last_press_time = time.time()
         self.is_idle = False
         self.floating_widget = None
         self.tray_icon = None
 
-        # Build UI
         self.build_ui()
         
         if self.show_widget_flag:
             self.toggle_widget()
 
-        # Start Listener safely
+        # Start Listener
         self.listener_thread = threading.Thread(target=self.start_listener, daemon=True)
         self.listener_thread.start()
 
         self.check_autostart()
-
-        # Background Loop
         self.update_ui()
         
-        if start_minimized:
-            self.after(100, self.hide_window) # Delay slightly to ensure UI is drawn before hiding
+        # Determine visibility
+        if not start_minimized:
+            self.deiconify()
+        else:
+            self.hide_window()
 
     def get_setting(self, key, cast_type, default):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
-        row = cursor.fetchone()
-        return cast_type(row[0]) if row else default
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
+            row = cursor.fetchone()
+            return cast_type(row[0]) if row else default
 
     def set_setting(self, key, value):
         with self.lock:
@@ -223,15 +235,16 @@ class KeyPulseApp(ctk.CTk):
         self.refresh_stats()
 
     def get_today_stats(self):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT keystrokes, max_kpm FROM daily_stats WHERE log_date = ?', (self.today,))
-        row = cursor.fetchone()
-        if row:
-            return row[0], row[1]
-        else:
-            cursor.execute('INSERT INTO daily_stats (log_date, keystrokes, max_kpm) VALUES (?, ?, ?)', (self.today, 0, 0))
-            self.conn.commit()
-            return 0, 0
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT keystrokes, max_kpm FROM daily_stats WHERE log_date = ?', (self.today,))
+            row = cursor.fetchone()
+            if row:
+                return row[0], row[1]
+            else:
+                cursor.execute('INSERT INTO daily_stats (log_date, keystrokes, max_kpm) VALUES (?, ?, ?)', (self.today, 0, 0))
+                self.conn.commit()
+                return 0, 0
 
     def update_db(self):
         with self.lock:
@@ -249,9 +262,8 @@ class KeyPulseApp(ctk.CTk):
             t = time.time()
             self.keystroke_timestamps.append(t)
             self.last_press_time = t
-            # Removed DB sync from here to prevent threading blockages. Moved to update_ui loop.
         except Exception:
-            pass # Keep listener alive no matter what
+            pass
 
     def start_listener(self):
         with keyboard.Listener(on_press=self.on_press) as listener:
@@ -259,19 +271,16 @@ class KeyPulseApp(ctk.CTk):
 
     def update_ui(self):
         try:
-            # Sync DB occasionally (approx every 5 seconds)
             self.save_ticker += 1
-            if self.save_ticker >= 25:
+            if self.save_ticker >= 25: # Every 5 seconds
                 self.save_ticker = 0
                 if self.count != self.last_saved_count:
                     self.update_db()
                     self.last_saved_count = self.count
 
-            # Update Main Counter
             self.count_label.configure(text=str(self.count))
             self.progress_bar.set(min(self.count / self.daily_goal, 1.0) if self.daily_goal > 0 else 1.0)
             
-            # Idle Detection
             current_time = time.time()
             self.is_idle = (current_time - self.last_press_time) > 120
             
@@ -280,7 +289,6 @@ class KeyPulseApp(ctk.CTk):
             else:
                 self.status_label.configure(text="Status: Active 🟢", text_color="#2FA572")
                 
-            # KPM Calculation
             self.keystroke_timestamps = [t for t in self.keystroke_timestamps if current_time - t <= 60]
             kpm = len(self.keystroke_timestamps)
             wpm = kpm // 5 
@@ -291,7 +299,6 @@ class KeyPulseApp(ctk.CTk):
                 
             self.kpm_label.configure(text=f"Speed: {kpm} KPM\n(~{wpm} WPM)")
             
-            # Update Floating Widget
             if self.floating_widget and self.floating_widget.winfo_exists():
                 self.floating_widget.update_text(kpm, self.count)
         
@@ -302,62 +309,59 @@ class KeyPulseApp(ctk.CTk):
             self.after(200, self.update_ui)
 
     def refresh_stats(self):
-        cursor = self.conn.cursor()
-        
-        cursor.execute('SELECT SUM(keystrokes), MAX(keystrokes) FROM daily_stats')
-        res = cursor.fetchone()
-        self.lifetime_total = res[0] if res[0] else 0
-        best_day_count = res[1] if res[1] else 0
-        
-        self.stat_total.configure(text=f"Lifetime Keystrokes: {self.lifetime_total:,}")
-        
-        cursor.execute('SELECT log_date FROM daily_stats WHERE keystrokes = ?', (best_day_count,))
-        best_day_row = cursor.fetchone()
-        best_day_date = best_day_row[0] if best_day_row else "N/A"
-        self.stat_best.configure(text=f"Best Day: {best_day_date} ({best_day_count:,} keys)")
-
-        # Badges Logic
-        badges = []
-        if self.lifetime_total >= 1000: badges.append("🥉 1k Typer")
-        if self.lifetime_total >= 10000: badges.append("🥈 10k Pro")
-        if self.max_kpm_today >= 200: badges.append("🔥 Speed Demon")
-        if self.max_kpm_today >= 400: badges.append("🚀 Flash")
-        if self.count >= self.daily_goal: badges.append("⭐ Goal Crusher")
-        
-        if not badges:
-            badges.append("Keep typing to unlock badges!")
+        with self.lock:
+            cursor = self.conn.cursor()
             
-        self.badges_display.configure(text=" | ".join(badges))
-
-        # 30-Day Heatmap
-        self.heat_canvas.delete("all")
-        day_counts = {}
-        for i in range(29, -1, -1):
-            d = str(date.today() - timedelta(days=i))
-            cursor.execute('SELECT keystrokes FROM daily_stats WHERE log_date = ?', (d,))
-            r = cursor.fetchone()
-            day_counts[d] = r[0] if r else 0
-
-        box_size = 20
-        padding = 5
-        start_x = (420 - (6 * (box_size + padding))) / 2
-        start_y = 10
-        
-        dates = list(day_counts.keys())
-        for i, d in enumerate(dates):
-            col = i // 5
-            row = i % 5
-            count = day_counts[d]
+            cursor.execute('SELECT SUM(keystrokes), MAX(keystrokes) FROM daily_stats')
+            res = cursor.fetchone()
+            self.lifetime_total = res[0] if res[0] else 0
+            best_day_count = res[1] if res[1] else 0
             
-            if count == 0: color = "#3a3a3a"
-            elif count < 1000: color = "#1f6aa5"
-            elif count < 3000: color = "#2FA572"
-            elif count < 6000: color = "#28cc83"
-            else: color = "#26ff9e"
+            self.stat_total.configure(text=f"Lifetime Keystrokes: {self.lifetime_total:,}")
             
-            x0 = start_x + col * (box_size + padding)
-            y0 = start_y + row * (box_size + padding)
-            self.heat_canvas.create_rectangle(x0, y0, x0+box_size, y0+box_size, fill=color, outline="")
+            cursor.execute('SELECT log_date FROM daily_stats WHERE keystrokes = ?', (best_day_count,))
+            best_day_row = cursor.fetchone()
+            best_day_date = best_day_row[0] if best_day_row else "N/A"
+            self.stat_best.configure(text=f"Best Day: {best_day_date} ({best_day_count:,} keys)")
+
+            badges = []
+            if self.lifetime_total >= 1000: badges.append("🥉 1k Typer")
+            if self.lifetime_total >= 10000: badges.append("🥈 10k Pro")
+            if self.max_kpm_today >= 200: badges.append("🔥 Speed Demon")
+            if self.max_kpm_today >= 400: badges.append("🚀 Flash")
+            if self.count >= self.daily_goal: badges.append("⭐ Goal Crusher")
+            if not badges: badges.append("Keep typing to unlock badges!")
+            self.badges_display.configure(text=" | ".join(badges))
+
+            # 30-Day Heatmap
+            self.heat_canvas.delete("all")
+            day_counts = {}
+            for i in range(29, -1, -1):
+                d = str(date.today() - timedelta(days=i))
+                cursor.execute('SELECT keystrokes FROM daily_stats WHERE log_date = ?', (d,))
+                r = cursor.fetchone()
+                day_counts[d] = r[0] if r else 0
+
+            box_size = 20
+            padding = 5
+            start_x = (420 - (6 * (box_size + padding))) / 2
+            start_y = 10
+            
+            dates = list(day_counts.keys())
+            for i, d in enumerate(dates):
+                col = i // 5
+                row = i % 5
+                count = day_counts[d]
+                
+                if count == 0: color = "#3a3a3a"
+                elif count < 1000: color = "#1f6aa5"
+                elif count < 3000: color = "#2FA572"
+                elif count < 6000: color = "#28cc83"
+                else: color = "#26ff9e"
+                
+                x0 = start_x + col * (box_size + padding)
+                y0 = start_y + row * (box_size + padding)
+                self.heat_canvas.create_rectangle(x0, y0, x0+box_size, y0+box_size, fill=color, outline="")
 
     # --- Actions & Settings ---
     def save_goal(self):
@@ -388,9 +392,10 @@ class KeyPulseApp(ctk.CTk):
     def export_csv(self):
         desktop = os.path.join(os.environ['USERPROFILE'], 'Desktop')
         path = os.path.join(desktop, 'KeyPulse_Export.csv')
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM daily_stats ORDER BY log_date DESC')
-        rows = cursor.fetchall()
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT * FROM daily_stats ORDER BY log_date DESC')
+            rows = cursor.fetchall()
         try:
             with open(path, 'w', newline='') as f:
                 writer = csv.writer(f)
@@ -434,7 +439,6 @@ class KeyPulseApp(ctk.CTk):
 
     def hide_window(self):
         self.withdraw()
-        # Create tray icon only if it doesn't exist
         if self.tray_icon is None:
             menu = pystray.Menu(
                 pystray.MenuItem('Open KeyPulse', self.show_window),
@@ -454,7 +458,7 @@ class KeyPulseApp(ctk.CTk):
         if self.tray_icon:
             self.tray_icon.stop()
         self.update_db()
-        os._exit(0)
+        self.quit() # Graceful exit
 
 if __name__ == "__main__":
     ctk.set_appearance_mode("dark")
