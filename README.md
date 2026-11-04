@@ -1,58 +1,40 @@
-# ⚡ KeyPulse
+# KeyPulse
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Python](https://img.shields.io/badge/python-3.8%2B-brightgreen.svg)
-![Open Source](https://img.shields.io/badge/Open%20Source-%E2%9D%A4-red.svg)
+A local Windows keyboard-activity counter. See daily presses, recent presses per minute, a daily goal and a 30-day history. A small optional floating widget and system-tray menu keep the count available without leaving the main window open.
 
-**KeyPulse** is a premium, privacy-focused desktop application that tracks your daily keyboard usage in real-time. It counts the number of keystrokes you make every day and visualizes your typing activity through a modern, sleek interface.
+## Run
 
-## 🌟 Ultra-Premium Features
-- **Floating Mini-Widget:** A semi-transparent, draggable floating widget stays always-on-top so you can see your live typing speed and daily count while working in other apps.
-- **Customizable Daily Goal:** Change your daily keystroke target directly from the Settings tab.
-- **WPM Calculator:** See your approximate Words Per Minute (WPM) in real-time alongside your KPM.
-- **Gamification & Badges:** Unlock achievements like "Speed Demon" and "Goal Crusher" based on your performance.
+Requires Windows and Python 3.12+. Use one running instance per Windows user.
 
-## 🚀 Advanced Premium Features
-- **Auto-Start with Windows:** Can automatically start silently in the background when Windows boots up.
-- **GitHub-Style Heatmap:** Visualize your last 30 days of typing activity in a beautiful color-coded grid.
-- **Idle Detection:** Automatically detects if you're AFK for more than 2 minutes and updates your status.
-- **Advanced Analytics:** View your *Lifetime Total Keystrokes*, *Best Day*, and *Maximum KPM*.
-- **Data Export:** Export your typing history directly to your Desktop as a CSV file with a single click.
+```powershell
+python -m venv .venv
+.venv/Scripts/python -m pip install -r requirements.txt
+.venv/Scripts/python src/keypulse.py
+```
 
-## ✨ Features
-- **Real-Time Tracking:** Watch your keystroke count go up in real-time as you type anywhere on your PC.
-- **Daily History:** Automatically saves your daily progress using a lightweight `SQLite` database.
-- **Privacy First (🔒):** KeyPulse only counts *how many* keys are pressed. It **never** records *which* keys are pressed. There is absolutely no keylogging functionality.
-- **Modern UI:** Built with `CustomTkinter` for a beautiful, dark-mode first desktop experience.
+Close hides the window to the tray; use **Exit** from the tray to save and stop the keyboard listener. Windows auto-start is opt-in through Settings. The app does not enable it during installation.
 
-## 🚀 Installation & Usage
+## What is recorded
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/almuzahidseyam/KeyPulse.git
-   cd KeyPulse
-   ```
+The operating-system keyboard hook receives key events, but the callback ignores key identities. Only daily totals and maximum recent count are written to SQLite. Recent one-second count buckets stay in memory; no typed text, key names, timestamps per key or network uploads are stored. Modifier keys and repeated key-down events count as presses. WPM is only a rough count/5 estimate, not a typing-test result.
 
-2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+Recent KPM uses 60 one-second buckets and therefore has one-second resolution. The speed window resets at a local calendar-date change; daily maximum KPM also starts from that day's saved maximum. Date rollover happens on both key callbacks and UI ticks, so the first key after midnight is not charged to yesterday. Sleep/resume and backward date changes reload the corresponding saved day. A monotonic clock measures recent speed and idle time.
 
-3. **Run the application:**
-   ```bash
-   python src/keypulse.py
-   ```
+## Data and export
 
-## 🛠️ Built With
-- [Python 3](https://www.python.org/)
-- [pynput](https://pynput.readthedocs.io/en/latest/) - For global OS keyboard hooks.
-- [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) - For the modern UI design.
-- [SQLite3](https://docs.python.org/3/library/sqlite3.html) - For local history storage.
+The default database is `%LOCALAPPDATA%/KeyPulse/keypulse.db`. Set `KEYPULSE_DB_PATH` to use another location. Counts flush every five seconds, at date changes, before export and on normal Exit. A crash or forced process termination can lose unsaved counts. If storage fails, the interface reports it; pending counts are retained in memory and Exit waits for a successful save.
 
-## 🤝 Contributing
+The old source-tree sample database is no longer distributed. To keep your own previous history, close KeyPulse, back up your database, and copy it to the new location before launching, or explicitly point `KEYPULSE_DB_PATH` at it. Do not overwrite an existing history file. The existing `daily_stats` schema is supported, including addition of the older missing `max_kpm` column.
 
-Contributions, issues, and feature requests are highly welcome! We want this to be an open-source tool built by the community. Feel free to check the [issues page](https://github.com/almuzahidseyam/KeyPulse/issues). Please read `CONTRIBUTING.md` for details.
+CSV export writes `KeyPulse_Export.csv` on the current Windows user's Desktop and replaces an existing export of that name. Back up exports you want to retain.
 
-## 📝 License
+## Verification
 
-This project is [MIT](LICENSE) licensed. Copyright © 2026 Muhammad Al-Muzahid.
+```powershell
+python -m unittest discover -s tests -v
+.venv/Scripts/python tests/ui_smoke.py
+```
+
+Nine counter tests cover midnight before the UI tick, idle rollover, multi-day resume, backward date changes, bounded speed history, peak persistence, concurrent callbacks, additive writes, failed saves and reload. CI runs them on Windows/Linux; the Windows UI check uses synthetic counts with the keyboard hook disabled. Dependency auditing also runs in CI.
+
+[MIT license](LICENSE).

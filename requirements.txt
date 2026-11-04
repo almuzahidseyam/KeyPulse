@@ -1,4 +1,7 @@
-﻿pynput==1.7.6
-customtkinter==5.2.2
+pynput==1.8.2
+customtkinter==6.0.0
 pystray==0.19.5
-Pillow==10.0.1
+Pillow==13.0.0
+six==1.17.0
+darkdetect==0.8.0
+packaging==26.3

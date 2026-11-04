@@ -10,12 +10,15 @@ import os
 import sys
 import csv
 import winreg
+from pathlib import Path
+from counter import DailyCounter
 
 # --- Database Setup ---
-DB_PATH = os.path.join(os.path.dirname(__file__), 'keypulse.db')
+DB_PATH = Path(os.environ.get('KEYPULSE_DB_PATH', str(Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'KeyPulse' / 'keypulse.db')))
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=3, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS daily_stats (
@@ -86,30 +89,30 @@ class FloatingWidget(ctk.CTkToplevel):
 
 # --- Main Application Class ---
 class KeyPulseApp(ctk.CTk):
-    def __init__(self, start_minimized=False):
+    def __init__(self, start_minimized=False, enable_listener=True):
         super().__init__()
         self.withdraw() # Hide immediately to prevent flicker on startup
         
-        self.title("KeyPulse - Ultra Premium")
+        self.title("KeyPulse")
         self.geometry("550x700")
         self.resizable(False, False)
         self.protocol('WM_DELETE_WINDOW', self.hide_window)
 
         # State Variables
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.conn = init_db()
-        self.today = str(date.today())
-        
-        self.count, self.max_kpm_today = self.get_today_stats()
-        self.last_saved_count = self.count
+        self.counter = DailyCounter(self.conn, self.lock)
+        state = self.counter.snapshot()
+        self.count, self.max_kpm_today = state['count'], state['maximum']
         self.save_ticker = 0
-        
+        self.listener = None
+        self.listener_error = None
+        self.closing = False
+
         self.daily_goal = self.get_setting("daily_goal", int, 5000)
         self.show_widget_flag = self.get_setting("show_widget", int, 0)
         self.lifetime_total = 0
         
-        self.keystroke_timestamps = []
-        self.last_press_time = time.time()
         self.is_idle = False
         self.floating_widget = None
         self.tray_icon = None
@@ -120,8 +123,9 @@ class KeyPulseApp(ctk.CTk):
             self.toggle_widget()
 
         # Start Listener
-        self.listener_thread = threading.Thread(target=self.start_listener, daemon=True)
-        self.listener_thread.start()
+        if enable_listener:
+            self.listener_thread = threading.Thread(target=self.start_listener, daemon=True)
+            self.listener_thread.start()
 
         self.check_autostart()
         self.update_ui()
@@ -234,81 +238,56 @@ class KeyPulseApp(ctk.CTk):
 
         self.refresh_stats()
 
-    def get_today_stats(self):
-        with self.lock:
-            cursor = self.conn.cursor()
-            cursor.execute('SELECT keystrokes, max_kpm FROM daily_stats WHERE log_date = ?', (self.today,))
-            row = cursor.fetchone()
-            if row:
-                return row[0], row[1]
-            else:
-                cursor.execute('INSERT INTO daily_stats (log_date, keystrokes, max_kpm) VALUES (?, ?, ?)', (self.today, 0, 0))
-                self.conn.commit()
-                return 0, 0
-
     def update_db(self):
-        with self.lock:
-            try:
-                cursor = self.conn.cursor()
-                cursor.execute('UPDATE daily_stats SET keystrokes = ?, max_kpm = ? WHERE log_date = ?', 
-                               (self.count, self.max_kpm_today, self.today))
-                self.conn.commit()
-            except sqlite3.Error as e:
-                print(f"Database error: {e}")
+        self.counter.flush()
 
     def on_press(self, key):
+        # The key object is deliberately ignored. Only the press is counted.
         try:
-            self.count += 1
-            t = time.time()
-            self.keystroke_timestamps.append(t)
-            self.last_press_time = t
+            self.counter.press()
         except Exception:
-            pass
+            self.listener_error = "Counting paused: local storage needs attention."
+            return False
 
     def start_listener(self):
-        with keyboard.Listener(on_press=self.on_press) as listener:
-            listener.join()
+        try:
+            self.listener = keyboard.Listener(on_press=self.on_press)
+            self.listener.start()
+            self.listener.join()
+        except Exception:
+            self.listener_error = "Keyboard access unavailable. Restart after checking permissions."
 
     def update_ui(self):
+        if self.closing:
+            return
         try:
+            state = self.counter.snapshot()
+            self.count, self.max_kpm_today = state['count'], state['maximum']
             self.save_ticker += 1
-            if self.save_ticker >= 25: # Every 5 seconds
+            if self.save_ticker >= 25:
+                self.update_db()
                 self.save_ticker = 0
-                if self.count != self.last_saved_count:
-                    self.update_db()
-                    self.last_saved_count = self.count
-
+                self.refresh_stats()
             self.count_label.configure(text=str(self.count))
+            self.max_kpm_label.configure(text=f"Max KPM: {self.max_kpm_today}")
             self.progress_bar.set(min(self.count / self.daily_goal, 1.0) if self.daily_goal > 0 else 1.0)
-            
-            current_time = time.time()
-            self.is_idle = (current_time - self.last_press_time) > 120
-            
-            if self.is_idle:
-                self.status_label.configure(text="Status: Idle 🟠", text_color="orange")
+            self.is_idle = state['idle']
+            if self.listener_error:
+                self.status_label.configure(text=self.listener_error, text_color="orange")
             else:
-                self.status_label.configure(text="Status: Active 🟢", text_color="#2FA572")
-                
-            self.keystroke_timestamps = [t for t in self.keystroke_timestamps if current_time - t <= 60]
-            kpm = len(self.keystroke_timestamps)
-            wpm = kpm // 5 
-            
-            if kpm > self.max_kpm_today:
-                self.max_kpm_today = kpm
-                self.max_kpm_label.configure(text=f"Max KPM: {self.max_kpm_today}")
-                
-            self.kpm_label.configure(text=f"Speed: {kpm} KPM\n(~{wpm} WPM)")
-            
+                self.status_label.configure(text="Status: Idle" if self.is_idle else "Status: Active", text_color="gray" if self.is_idle else "#2FA572")
+            kpm = state['kpm']
+            self.kpm_label.configure(text=f"Speed: {kpm} KPM\n(~{kpm // 5} WPM)")
             if self.floating_widget and self.floating_widget.winfo_exists():
                 self.floating_widget.update_text(kpm, self.count)
-        
-        except Exception as e:
-            print(f"UI Update error: {e}")
-            
+        except Exception:
+            self.status_label.configure(text="Could not save local counts; pending counts remain in memory.", text_color="orange")
         finally:
-            self.after(200, self.update_ui)
+            if not self.closing:
+                self.after(200, self.update_ui)
 
     def refresh_stats(self):
+        self.update_db()
         with self.lock:
             cursor = self.conn.cursor()
             
@@ -390,6 +369,7 @@ class KeyPulseApp(ctk.CTk):
                 self.floating_widget = None
 
     def export_csv(self):
+        self.update_db()
         desktop = os.path.join(os.environ['USERPROFILE'], 'Desktop')
         path = os.path.join(desktop, 'KeyPulse_Export.csv')
         with self.lock:
@@ -448,17 +428,36 @@ class KeyPulseApp(ctk.CTk):
             threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
     def show_window(self, icon, item):
-        if self.tray_icon:
-            self.tray_icon.stop()
-            self.tray_icon = None
-        self.after(0, self.deiconify)
-        self.refresh_stats()
+        def show():
+            if self.tray_icon:
+                self.tray_icon.stop()
+                self.tray_icon = None
+            self.deiconify()
+            self.refresh_stats()
+        self.after(0, show)
 
-    def quit_window(self, icon, item):
+    def quit_window(self, icon=None, item=None):
+        self.after(0, self.shutdown)
+
+    def shutdown(self):
+        if self.closing:
+            return
+        self.closing = True
+        if self.listener:
+            self.listener.stop()
+            self.listener.join(timeout=3)
         if self.tray_icon:
             self.tray_icon.stop()
-        self.update_db()
-        self.quit() # Graceful exit
+        try:
+            self.update_db()
+        except sqlite3.Error:
+            self.closing = False
+            self.listener_error = "Counting paused. Save failed; fix storage and retry Exit."
+            self.deiconify()
+            self.update_ui()
+            return
+        self.conn.close()
+        self.destroy()
 
 if __name__ == "__main__":
     ctk.set_appearance_mode("dark")
@@ -470,4 +469,5 @@ if __name__ == "__main__":
     try:
         app.mainloop()
     finally:
-        app.update_db()
+        if not app.closing:
+            app.shutdown()
